@@ -1,0 +1,128 @@
+{
+  "Middle East // When it comes to their values, how much do you think immigrants from each of the following regions have in common with most Americans?": {
+    "distribution": {
+      "A great deal": 0,
+      "A fair amount": 0,
+      "Some": 0,
+      "Not too much": 0,
+      "Nothing at all": 0
+    },
+    "supports": []
+  },
+  "Crime // What type of impact do you think immigrants living in the country illegally are having on each of the following areas?": {
+    "distribution": {
+      "Making things better": 0,
+      "Making things worse": 0,
+      "Not having much effect": 0
+    },
+    "supports": []
+  },
+  "Do you listen to the radio?": {
+    "distribution": {
+      "Yes": 0,
+      "No": 0
+    },
+    "supports": []
+  },
+  "Have you ever experienced or believed in any of the following?": {
+    "distribution": {
+      "Had a sudden feeling of connection with something from beyond this world": 0,
+      "Had a strong feeling that someone who has passed away was communicating with you from beyond this world": 0,
+      "Believe that spirits or unseen spiritual forces exist and have personally encountered one": 0
+    },
+    "supports": []
+  },
+  "What benefits do you think video games provide?": {
+    "distribution": {
+      "Bring people joy": 0,
+      "Provide mental stimulation": 0,
+      "Provide stress relief": 0,
+      "Help improve cognitive skills": 0,
+      "Create a feeling of community": 0
+    },
+    "supports": []
+  },
+  "Social and cultural values // What type of impact do you think immigrants living in the country illegally are having on each of the following areas?": {
+    "distribution": {
+      "Making things better": 0,
+      "Making things worse": 0,
+      "Not having much effect": 0
+    },
+    "supports": []
+  },
+  "People who come from countries not well represented in the U.S. // How much priority should be given to each of the following?": {
+    "distribution": {
+      "Top priority": 0,
+      "Some priority": 0,
+      "No priority": 0
+    },
+    "supports": []
+  },
+  "Which comes closer to your view - even if neither is exactly right?": {
+    "distribution": {
+      "Immigrants in our country today should adopt American customs and way of life": 0,
+      "Immigrants in our country today should be able to hold on to the customs and way of life of their home country": 0
+    },
+    "supports": []
+  },
+  "Crime // What type of impact do you think immigrants living in the country legally are having on each of the following areas?": {
+    "distribution": {
+      "Making things better": 0,
+      "Making things worse": 0,
+      "Not having much effect": 0
+    },
+    "supports": []
+  },
+  "Africa // When it comes to their values, how much do you think immigrants from each of the following regions have in common with most Americans?": {
+    "distribution": {
+      "A great deal": 0,
+      "A fair amount": 0,
+      "Some": 0,
+      "Not too much": 0,
+      "Nothing at all": 0
+    },
+    "supports": []
+  },
+  "People who have close family members already living in the U.S. // How much priority should be given to each of the following?": {
+    "distribution": {
+      "Top priority": 0,
+      "Some priority": 0,
+      "No priority": 0
+    },
+    "supports": []
+  },
+  "How much have you seen, read, or heard about illegal immigration in the news lately?": {
+    "distribution": {
+      "A great deal": 0,
+      "A fair amount": 0,
+      "Some": 0,
+      "Not too much": 0,
+      "Nothing at all": 0
+    },
+    "supports": []
+  },
+  "How do you prefer your sandwiches to be served?": {
+    "distribution": {
+      "Cut into rectangles": 0,
+      "Cut into triangles": 0,
+      "Whole and uncut": 0
+    },
+    "supports": []
+  },
+  "Is there at least one working telephone inside your home that is not a cell phone?": {
+    "distribution": {
+      "Yes": 0,
+      "No": 0
+    },
+    "supports": []
+  },
+  "How concerned are you about how Companies use the data they collect about you?": {
+    "distribution": {
+      "Very concerned": 0,
+      "Somewhat concerned": 0,
+      "Not very concerned": 0,
+      "Not at all concerned": 0
+    },
+    "supports": []
+  }
+}

@@ -1,0 +1,18 @@
+# requirements.txt  (Python 3.9, CPU-only)
+
+numpy
+PyYAML
+tqdm
+retry
+beautifulsoup4
+ftfy
+scikit-learn
+scipy
+Whoosh
+together
+
+# Optional (uncomment if you use them; stay within course constraints)
+# faiss-cpu           # vector search
+# nltk                # tokenization / stopwords
+# transformers        # use small models (<0.8B), CPU-only
+# torch               # CPU-only; do not enable CUDA

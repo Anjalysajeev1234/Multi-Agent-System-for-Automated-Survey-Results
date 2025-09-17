@@ -1,0 +1,13 @@
+# config.yaml
+seed: 42
+
+data:
+  documents_path: ./data/mini_documents.jsonl
+  questions_path: ./data/dev/mini_dev.json
+
+index:
+  output_dir: ./artifacts/index  # placeholder; created by index.build
+
+run:
+  output_csv: ./artifacts/submission_js.csv  # write your CSV (question,distribution,supports)
+  supports_k: 100                             # MUST be 100 on full competition
