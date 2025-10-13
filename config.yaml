@@ -1,64 +1,101 @@
+# seed: 42
+
+# env:
+#   python: "3.9"
+#   device: "cpu"
+
+# data:
+#   # MINI RUN (current)
+#   documents_path: "./data/mini_documents.jsonl"
+#   questions_path: "./data/mini_dev.json"
+
+#   # FULL RUN (uncomment when switching)
+#   # documents_path: "./data/documents.jsonl"
+#   # questions_path: "./data/dev.json"
+
+#   # Provided dense store (for FAISS)
+#   embeddings_path: "./data/id_to_embedding.npz"
+
+# # <<< IMPORTANT: scripts expect this block & key >>>
+# index:
+#   output_dir: "./artifacts/index"   # this folder will contain:
+#                                     #  - tfidf_index.npz
+#                                     #  - tfidf_vocab.json
+#                                     #  - tfidf_id_map.json
+#                                     #  - (optional) faiss.index
+#                                     #  - (optional) dense_id_map.json
+
+# retrieval:
+#   top_k_sparse: 800
+#   top_k_dense: 800
+#   use_dense: true
+#   rrf_k: 60
+
+# filtering:
+#   dedup_sim_thresh: 0.98
+
+# labeling:
+#   top_docs_for_label: 200
+#   dirichlet_alpha: 0.5
+#   # max_options is handled internally; not required here
+
+# supports:
+#   size: 100
+#   subreddit_cap: 5
+
+
+# run:
+#   output_csv: "./artifacts/submission_js.csv"
+#   audit_log: "./artifacts/audit.jsonl"
+
+# budget:
+#   usd_cap: 10.0
+
+# labeling:
+#   provider: "together"
+#   # pick ONE of these:
+#   model: "Qwen/Qwen2.5-7B-Instruct-Turbo"
+#   # model: "mistralai/Mistral-7B-Instruct-v0.1"
+#   # model: "mistralai/Mixtral-8x7B-Instruct-v0.1"   # bigger, still serverless
+#   batch_size: 8
+#   top_docs_for_label: 160
+#   dirichlet_alpha: 0.2
+#   temperature: 0.8
+
 seed: 42
 
-env:
-  python: "3.9"
-  device: "cpu"
-
 data:
-  # MINI RUN (current)
-  documents_path: "./data/mini_documents.jsonl"
-  questions_path: "./data/mini_dev.json"
+  documents_path: "./data/documents.jsonl"      # keep MINI for sanity run
+  questions_path: "./data/dev.json"
+  embeddings_path: "./data/id_to_embedding.npz"      # unused in this baseline
 
-  # FULL RUN (uncomment when switching)
-  # documents_path: "./data/documents.jsonl"
-  # questions_path: "./data/dev.json"
-
-  # Provided dense store (for FAISS)
-  embeddings_path: "./data/id_to_embedding.npz"
-
-# <<< IMPORTANT: scripts expect this block & key >>>
 index:
-  output_dir: "./artifacts/index"   # this folder will contain:
-                                    #  - tfidf_index.npz
-                                    #  - tfidf_vocab.json
-                                    #  - tfidf_id_map.json
-                                    #  - (optional) faiss.index
-                                    #  - (optional) dense_id_map.json
+  output_dir: "./artifacts/index"
+  build_sparse: true
+  build_dense: false
 
 retrieval:
   top_k_sparse: 800
-  top_k_dense: 800
-  use_dense: true
-  rrf_k: 60
+  use_dense: false          # <-- disable FAISS (dense)
+  rrf_k: 60                 # kept for consistency; unused when only TF-IDF
 
 filtering:
-  dedup_sim_thresh: 0.98
+  min_tokens: 10
+  dedup_sim_thresh: 0.96
 
 labeling:
-  top_docs_for_label: 200
-  dirichlet_alpha: 0.5
-  # max_options is handled internally; not required here
+  provider: "cosine"        # <-- NO LLM
+  top_docs_for_label: 160
+  temperature: 0.8
+  dirichlet_alpha: 0.2
+  batch_size: 8             # ignored in cosine mode
+  max_options: 12
 
 supports:
   size: 100
   subreddit_cap: 5
 
-
 run:
   output_csv: "./artifacts/submission_js.csv"
   audit_log: "./artifacts/audit.jsonl"
-
-budget:
-  usd_cap: 10.0
-
-labeling:
-  provider: "together"
-  # pick ONE of these:
-  model: "Qwen/Qwen2.5-7B-Instruct-Turbo"
-  # model: "mistralai/Mistral-7B-Instruct-v0.1"
-  # model: "mistralai/Mixtral-8x7B-Instruct-v0.1"   # bigger, still serverless
-  batch_size: 8
-  top_docs_for_label: 160
-  dirichlet_alpha: 0.2
-  temperature: 0.8
 
