@@ -216,3 +216,20 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# data (large)
+data/documents.jsonl
+data/id_to_embedding.npz
+
+# run artifacts
+artifacts/
+*.index
+*.npz
+*.csv
+*.jsonl
+*.json
+
+# venv / OS
+.venv/
+__pycache__/
+.DS_Store

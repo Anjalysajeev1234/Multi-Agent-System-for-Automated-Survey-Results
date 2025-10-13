@@ -1,13 +1,64 @@
-# config.yaml
 seed: 42
 
-data:
-  documents_path: ./data/mini_documents.jsonl
-  questions_path: ./data/dev/mini_dev.json
+env:
+  python: "3.9"
+  device: "cpu"
 
+data:
+  # MINI RUN (current)
+  documents_path: "./data/mini_documents.jsonl"
+  questions_path: "./data/mini_dev.json"
+
+  # FULL RUN (uncomment when switching)
+  # documents_path: "./data/documents.jsonl"
+  # questions_path: "./data/dev.json"
+
+  # Provided dense store (for FAISS)
+  embeddings_path: "./data/id_to_embedding.npz"
+
+# <<< IMPORTANT: scripts expect this block & key >>>
 index:
-  output_dir: ./artifacts/index  # placeholder; created by index.build
+  output_dir: "./artifacts/index"   # this folder will contain:
+                                    #  - tfidf_index.npz
+                                    #  - tfidf_vocab.json
+                                    #  - tfidf_id_map.json
+                                    #  - (optional) faiss.index
+                                    #  - (optional) dense_id_map.json
+
+retrieval:
+  top_k_sparse: 800
+  top_k_dense: 800
+  use_dense: true
+  rrf_k: 60
+
+filtering:
+  dedup_sim_thresh: 0.98
+
+labeling:
+  top_docs_for_label: 200
+  dirichlet_alpha: 0.5
+  # max_options is handled internally; not required here
+
+supports:
+  size: 100
+  subreddit_cap: 5
+
 
 run:
-  output_csv: ./artifacts/submission_js.csv  # write your CSV (question,distribution,supports)
-  supports_k: 100                             # MUST be 100 on full competition
+  output_csv: "./artifacts/submission_js.csv"
+  audit_log: "./artifacts/audit.jsonl"
+
+budget:
+  usd_cap: 10.0
+
+labeling:
+  provider: "together"
+  # pick ONE of these:
+  model: "Qwen/Qwen2.5-7B-Instruct-Turbo"
+  # model: "mistralai/Mistral-7B-Instruct-v0.1"
+  # model: "mistralai/Mixtral-8x7B-Instruct-v0.1"   # bigger, still serverless
+  batch_size: 8
+  top_docs_for_label: 160
+  dirichlet_alpha: 0.2
+  temperature: 0.8
+
