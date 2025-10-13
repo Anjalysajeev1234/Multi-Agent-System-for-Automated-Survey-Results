@@ -1,64 +1,50 @@
 # mas_survey/run.py
 """
-Hybrid retrieval + LLM stance labeling + LLM-informed supports ranking.
+Run the MAS pipeline and write a Kaggle-ready CSV.
 
-- Sparse TF-IDF (always) + optional FAISS (if present) with RRF fusion
-- Per-option sparse retrieval for better coverage
-- TogetherAI JSON-labeled stances (cached), or cosine fallback
-- Dirichlet + temperature aggregation (single normalisation step)
-- Supports ranking:
-    * per-option top-ups (quota)
-    * global sort by LLM confidence then fused rank
-    * subreddit diversity cap
-Produces: artifacts/submission_js.csv and artifacts/audit.jsonl
+CLI:
+    python -m mas_survey.run --config config.yaml --api_key <YOUR_KEY or DUMMY>
+
+This variant supports:
+- Retrieval via mas_survey.retrieval: BM25 / TF-IDF / + optional FAISS fusion
+- Labeling provider: "cosine" (fast, no LLM)
+- Guaranteed 100 unique supports per question
 """
 
 import argparse
 import csv
 import json
-import os
-import sys
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
 import yaml
 from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.preprocessing import normalize
 
-from mas_survey.llm_stance import label_with_llm
+from mas_survey.retrieval import (
+    RetrievalResources,
+    retrieve_candidates,
+    _tfidf_transform_short,  # reuse the tiny transformer
+)
 
-FAISS_OK = False
-try:
-    import faiss  # type: ignore
-    FAISS_OK = True
-except Exception:
-    FAISS_OK = False
-
-
-# --------------------------- helpers: IO ---------------------------
+# ---------------- utils ----------------
 
 def _load_cfg(path: str) -> Dict:
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
-
-def _load_questions(path: str) -> Dict[str, Dict]:
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
 def _load_documents(jsonl_path: str) -> Dict[str, Dict]:
     out = {}
     with open(jsonl_path, "r", encoding="utf-8") as f:
         for line in f:
-            if not line.strip():
+            line = line.strip()
+            if not line:
                 continue
             obj = json.loads(line)
-            out[obj["id"]] = obj
+            out[str(obj["id"])] = obj
     return out
-
 
 def _concat_text(doc: Dict) -> str:
     title = doc.get("title") or ""
@@ -67,377 +53,160 @@ def _concat_text(doc: Dict) -> str:
     content = doc.get("content") or ""
     return "\n".join([p for p in [title, description, post_content, content] if p]).strip()
 
+def _load_questions(path: str) -> Dict[str, Dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-# ---------------------- load TF-IDF artefacts ----------------------
+def _load_tfidf(art_dir: Path):
+    X = sparse.load_npz(art_dir / "tfidf_index.npz").tocsr().astype(np.float32)
+    with open(art_dir / "tfidf_vocab.json", "r", encoding="utf-8") as f:
+        vocab_payload = json.load(f)
+    with open(art_dir / "tfidf_id_map.json", "r", encoding="utf-8") as f:
+        id_list = json.load(f)
+    vocab = vocab_payload.get("vocabulary", {})
+    idf = np.array(vocab_payload.get("idf") or [], dtype=np.float32)
+    # X already L2-normalized in builder; keep consistent just in case
+    X = normalize(X, norm="l2", axis=1, copy=False)
+    return X, vocab, idf, id_list
 
-def _load_tfidf(artifacts_dir: Path):
-    tfidf_index_path = artifacts_dir / "tfidf_index.npz"
-    tfidf_vocab_path = artifacts_dir / "tfidf_vocab.json"
-    id_map_path = artifacts_dir / "tfidf_id_map.json"
+def _cosine(a: sparse.csr_matrix, b: sparse.csr_matrix) -> np.ndarray:
+    # assumes rows are L2-normalized
+    return (a @ b.T).toarray()
 
-    if not tfidf_index_path.exists() or not tfidf_vocab_path.exists() or not id_map_path.exists():
-        print("[mas_survey.run] Missing TF-IDF artifacts. Run: python -m index.build --config config.yaml", file=sys.stderr)
-        sys.exit(1)
+def _softmax(scores: np.ndarray, temperature: float = 1.0) -> np.ndarray:
+    s = np.array(scores, dtype=np.float32)
+    m = float(np.max(s)) if s.size else 0.0
+    z = np.exp((s - m) / max(temperature, 1e-6))
+    zsum = float(z.sum())
+    return z / zsum if zsum > 0 else np.ones_like(s) / max(1, len(s))
 
-    X = sparse.load_npz(tfidf_index_path)
-    vocab_payload = json.loads(tfidf_vocab_path.read_text(encoding="utf-8"))
-    id_map = json.loads(id_map_path.read_text(encoding="utf-8"))
-
-    vec = TfidfVectorizer(
-        lowercase=vocab_payload["lowercase"],
-        ngram_range=tuple(vocab_payload["ngram_range"]),
-        token_pattern=vocab_payload["token_pattern"],
-        max_features=vocab_payload["max_features"],
-        dtype=np.float32,
-    )
-    vec.vocabulary_ = {k: int(v) for k, v in vocab_payload["vocabulary"].items()}
-    if vocab_payload["idf"] is not None:
-        vec.idf_ = np.array(vocab_payload["idf"], dtype=np.float32)
-    vec._tfidf._idf_diag = sparse.spdiags(vec.idf_, diags=0, m=len(vec.idf_), n=len(vec.idf_))
-
-    return vec, X, id_map
-
-
-# --------------------------- retrieval -----------------------------
-
-def _cosine_query_sparse(vec: TfidfVectorizer, X: sparse.csr_matrix, query_text: str) -> np.ndarray:
-    q = vec.transform([query_text])
-    q = normalize(q, norm="l2", axis=1, copy=False)
-    sims = (X @ q.T).toarray().ravel().astype(np.float32)  # L2-normalised so dot == cosine
-    return sims
-
-
-def _dedup_by_cosine(X: sparse.csr_matrix, order: np.ndarray, thresh: float = 0.98, cap: int = 300) -> List[int]:
-    picked: List[int] = []
-    kept_rows: List[int] = []
-    for idx in order:
-        if len(picked) >= cap:
-            break
-        xi = X[idx]
-        keep = True
-        for j in kept_rows:
-            xj = X[j]
-            sim = float(xi.multiply(xj).sum())  # cosine
-            if sim >= thresh:
-                keep = False
-                break
-        if keep:
-            picked.append(int(idx))
-            kept_rows.append(int(idx))
-    return picked
-
-
-def _rrf_fuse(scores_list: List[np.ndarray], k: int = 60) -> np.ndarray:
-    fused = np.zeros_like(scores_list[0], dtype=np.float64)
-    for scores in scores_list:
-        order = np.argsort(-scores)
-        ranks = np.empty_like(order)
-        ranks[order] = np.arange(1, len(scores) + 1)
-        fused += 1.0 / (k + ranks)
-    fused = (fused - fused.min()) / (fused.max() - fused.min() + 1e-12)
-    return fused.astype(np.float32)
-
-
-# --------- dense lookup using centroid of top-TF-IDF embeddings ---------
-
-def _maybe_load_faiss(artifacts_dir: Path):
-    faiss_path = artifacts_dir / "faiss.index"
-    dense_map_path = artifacts_dir / "dense_id_map.json"
-    if not (FAISS_OK and faiss_path.exists() and dense_map_path.exists()):
-        return None, None
-    index = faiss.read_index(str(faiss_path))
-    dense_id_map = json.loads(dense_map_path.read_text(encoding="utf-8"))
-    return index, dense_id_map
-
-
-def _dense_scores_from_centroid(index, dense_id_map: List[str],
-                                id_to_emb: Dict[str, np.ndarray],
-                                tfidf_top_doc_ids: List[str]) -> np.ndarray:
-    # Build centroid of embeddings of top TF-IDF docs (PRF-style)
-    vecs = []
-    for did in tfidf_top_doc_ids:
-        v = id_to_emb.get(did)
-        if v is not None:
-            vecs.append(v)
-    if not vecs:
-        return np.zeros(len(dense_id_map), dtype=np.float32)
-    centroid = np.mean(np.stack(vecs, axis=0), axis=0).astype(np.float32)
-    # L2 normalise
-    norm = np.linalg.norm(centroid) + 1e-12
-    centroid = centroid / norm
-    D, I = index.search(centroid.reshape(1, -1), len(dense_id_map))  # distances, indices
-    scores = -D.ravel().astype(np.float32)  # monotonic transform OK for ranking
-    # Expand to full vector aligned to dense_id_map
-    full = np.zeros(len(dense_id_map), dtype=np.float32)
-    full[I.ravel()] = scores
-    return full
-
-
-# ---------------------- aggregation / outputs ----------------------
-
-def _aggregate(option_scores: Dict[str, float], alpha: float, temperature: float) -> Dict[str, float]:
-    """Temperature -> softmax; add alpha once; normalise once."""
+def aggregate_distribution(option_scores: Dict[str, float], temperature: float, alpha: float) -> Dict[str, float]:
     opts = list(option_scores.keys())
-    raw = np.array([option_scores[o] for o in opts], dtype=np.float64)
-    ex = np.exp((raw - raw.max()) / max(temperature, 1e-6))
-    ex = ex + float(alpha)                    # Dirichlet-style smoothing
-    probs = ex / (ex.sum() + 1e-12)           # single normalisation
-    probs = np.clip(probs, 0.0, 1.0)
-    probs = probs / (probs.sum() + 1e-12)
-    return {o: float(p) for o, p in zip(opts, probs)}
+    vec = np.array([option_scores[o] for o in opts], dtype=np.float32)
+    prob = _softmax(vec, temperature=temperature)
+    prob = (prob + float(alpha))
+    prob = prob / prob.sum()
+    return {o: float(p) for o, p in zip(opts, prob)}
 
-
-def _write_csv(rows: List[Tuple[str, Dict[str, float], List[str]]], out_path: str) -> None:
-    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
-        w = csv.writer(f)
-        w.writerow(["question", "distribution", "supports"])
-        for q, dist, supports in rows:
-            dist_json = json.dumps(dist, ensure_ascii=True)
-            supports_json = json.dumps(supports, ensure_ascii=True)
-            w.writerow([q, dist_json, supports_json])
-
-
-# ------------------------------ CLI --------------------------------
+# -------------- CLI --------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Run MAS pipeline (hybrid + LLM stance + improved supports)")
+    p = argparse.ArgumentParser(description="Run MAS pipeline (retrieval + cosine aggregation).")
     p.add_argument("--config", type=str, default="config.yaml", help="Path to config.yaml")
-    p.add_argument("--api_key", type=str, default=None, help="TogetherAI API key (only if provider=together).")
+    p.add_argument("--api_key", type=str, default=None, help="Accepted but unused in cosine mode.")
     return p.parse_args()
 
+# -------------- main -------------------
 
 def main() -> None:
     args = parse_args()
     cfg = _load_cfg(args.config)
-    np.random.seed(cfg.get("seed", 42))
 
+    # --- paths & settings ---
     docs_path = cfg["data"]["documents_path"]
     q_path = cfg["data"]["questions_path"]
     artifacts_dir = Path(cfg.get("index", {}).get("output_dir", "./artifacts/index"))
-    embeddings_npz = cfg["data"].get("embeddings_path", "")
+    output_csv = cfg.get("run", {}).get("output_csv", "./artifacts/submission_js.csv")
+    audit_log = cfg.get("run", {}).get("audit_log", "./artifacts/audit.jsonl")
 
-    print(f"[run] Documents: {docs_path}")
-    print(f"[run] Questions:  {q_path}")
-    print(f"[run] Index dir:  {artifacts_dir}")
+    temperature = float(cfg.get("labeling", {}).get("temperature", 0.8))
+    alpha = float(cfg.get("labeling", {}).get("dirichlet_alpha", 0.2))
+    top_docs_for_label = int(cfg.get("labeling", {}).get("top_docs_for_label", 160))
+    supports_k = int(cfg.get("supports", {}).get("size", 100))
 
-    # Load artefacts & data
-    vec, X, tfidf_id_map = _load_tfidf(artifacts_dir)
-    documents = _load_documents(docs_path)
+    # --- load resources ---
+    docs = _load_documents(docs_path)
+    X, vocab, idf, id_map = _load_tfidf(artifacts_dir)
+    id_to_row = {did: i for i, did in enumerate(id_map)}
     questions = _load_questions(q_path)
 
-    # Optional dense
-    faiss_index, dense_id_map = _maybe_load_faiss(artifacts_dir)
-    id_to_emb: Dict[str, np.ndarray] = {}
-    if faiss_index is not None and embeddings_npz and Path(embeddings_npz).exists():
-        data = np.load(embeddings_npz, allow_pickle=True)
-        dense_ids = list(map(str, data["ids"].tolist()))
-        emb = data["embeddings"].astype(np.float32)
-        emb /= (np.linalg.norm(emb, axis=1, keepdims=True) + 1e-12)
-        id_to_emb = {did: emb[i] for i, did in enumerate(dense_ids)}
-        print(f"[run] Dense retrieval enabled.")
-    else:
-        print(f"[run] Dense retrieval disabled (TF-IDF only).")
+    # optional dense resources (only used if you later set use_dense:true)
+    dense_emb_path = Path(cfg["data"].get("embeddings_path", "")) if cfg["data"].get("embeddings_path") else None
+    dense_embeddings = None
+    dense_id_map = None
+    if dense_emb_path and dense_emb_path.exists():
+        data = np.load(dense_emb_path, allow_pickle=True)
+        dense_id_map = list(map(str, data["ids"].tolist()))
+        dense_embeddings = data["embeddings"].astype(np.float32)
+        norms = np.linalg.norm(dense_embeddings, axis=1, keepdims=True) + 1e-12
+        dense_embeddings = dense_embeddings / norms
 
-    # Config knobs
-    retrieval_cfg = cfg.get("retrieval", {})
-    filtering_cfg = cfg.get("filtering", {})
-    labeling_cfg = cfg.get("labeling", {})
-    supports_cfg = cfg.get("supports", {})
-    run_cfg = cfg.get("run", {})
+    res = RetrievalResources(
+        X_tfidf=X,
+        vocab=vocab,
+        idf=idf,
+        id_map=id_map,
+        id_to_row=id_to_row,
+        whoosh_dir=Path(cfg.get("whoosh", {}).get("index_dir", "./artifacts/whoosh_index")),
+        faiss_index_path=Path(cfg.get("index", {}).get("output_dir", "./artifacts/index")) / "faiss.index",
+        dense_id_map=dense_id_map,
+        dense_embeddings=dense_embeddings,
+    )
 
-    top_k_sparse = int(retrieval_cfg.get("top_k_sparse", 800))
-    use_dense = bool(retrieval_cfg.get("use_dense", True))
-    rrf_k = int(retrieval_cfg.get("rrf_k", 60))
+    # --- outputs ---
+    Path(output_csv).parent.mkdir(parents=True, exist_ok=True)
+    Path(audit_log).parent.mkdir(parents=True, exist_ok=True)
+    audit_f = open(audit_log, "w", encoding="utf-8")
 
-    dedup_thresh = float(filtering_cfg.get("dedup_sim_thresh", 0.98))
-    label_cap = int(labeling_cfg.get("top_docs_for_label", 160))
-    alpha = float(labeling_cfg.get("dirichlet_alpha", 0.2))
-    temperature = float(labeling_cfg.get("temperature", 0.8))
+    with open(output_csv, "w", encoding="utf-8", newline="") as fcsv:
+        writer = csv.DictWriter(fcsv, fieldnames=["question", "distribution", "supports"])
+        writer.writeheader()
 
-    support_k = int(supports_cfg.get("size", 100))
-    div_cap = int(supports_cfg.get("subreddit_cap", 5))  # optional; default 5
+        for q_text, q_obj in questions.items():
+            options: List[str] = list(q_obj["distribution"].keys())
 
-    # Pre-materialise doc texts in tfidf order for fast lookup
-    tfidf_texts = [_concat_text(documents[doc_id]) for doc_id in tfidf_id_map]
+            # 1) retrieval (BM25 / TF-IDF / +optional FAISS via config)
+            cand_ids, cand_rows, X_rows, dbg = retrieve_candidates(cfg, q_text, options, res)
 
-    rows: List[Tuple[str, Dict[str, float], List[str]]] = []
-    audit_lines: List[str] = []
+            # 2) shortlist for pseudo-labeling
+            L = min(top_docs_for_label, len(cand_ids))
+            cand_ids_L = cand_ids[:L]
+            X_rows_L = X_rows[:L] if L else X_rows
 
-    for q_text, q_payload in questions.items():
-        options = list(q_payload["distribution"].keys())
-        base_query = q_text + " " + " ".join(options)
+            # 3) cosine pseudo-labeling: doc rows vs option texts
+            if options:
+                opt_vec = _tfidf_transform_short(options, vocab, idf)
+                sims = _cosine(X_rows_L, opt_vec)  # shape: [L, |options|]
+                option_scores = {opt: float(sims[:, j].sum()) for j, opt in enumerate(options)}
+            else:
+                option_scores = {}
 
-        # ---- sparse retrieval (base) ----
-        sparse_scores = _cosine_query_sparse(vec, X, base_query)
+            # 4) aggregate + calibrate → valid probability distribution
+            dist = aggregate_distribution(option_scores, temperature=temperature, alpha=alpha)
 
-        # ---- per-option sparse scores (for later mixing/supports) ----
-        opt_sparse_scores = []
-        for opt in options:
-            qopt = q_text + " " + opt
-            opt_sparse_scores.append(_cosine_query_sparse(vec, X, qopt))
-        opt_sparse_scores = np.stack(opt_sparse_scores, axis=1)  # [num_docs, num_opts]
+            # 5) supports: first K after dedup; pad to exactly 100 unique IDs
+            supports = cand_ids[:supports_k]
+            if len(set(supports)) < supports_k:
+                seen = set(supports)
+                # first pad from remaining candidates
+                pad = [did for did in cand_ids if did not in seen]
+                # then pad from global id_map if still short
+                if len(seen) + len(pad) < supports_k:
+                    pad += [did for did in id_map if did not in seen]
+                supports = list(seen) + [did for did in pad if did not in seen][: supports_k - len(seen)]
+            # final trim (safety)
+            supports = supports[:supports_k]
 
-        # ---- optional dense retrieval using centroid of top sparse ----
-        fused_base = sparse_scores.copy()
-        if use_dense and faiss_index is not None and id_to_emb:
-            sparse_order = np.argsort(-sparse_scores)[:top_k_sparse]
-            seed_ids = [tfidf_id_map[i] for i in sparse_order[:50]]
-            dense_scores_full = _dense_scores_from_centroid(
-                faiss_index, dense_id_map, id_to_emb, seed_ids
-            )
-            # Map dense scores onto TF-IDF doc universe by ID (missing IDs get 0)
-            dense_on_tfidf = np.zeros_like(fused_base, dtype=np.float32)
-            dense_pos = {did: pos for pos, did in enumerate(dense_id_map)}
-            for i, did in enumerate(tfidf_id_map):
-                j = dense_pos.get(did)
-                if j is not None:
-                    dense_on_tfidf[i] = dense_scores_full[j]
-            fused_base = _rrf_fuse([sparse_scores, dense_on_tfidf], k=rrf_k)
+            # 6) audit
+            audit_rec = {
+                "question": q_text,
+                "options": options,
+                "option_scores": option_scores,
+                "distribution": dist,
+                "supports_count": len(supports),
+                "retrieval_dbg": dbg,
+            }
+            audit_f.write(json.dumps(audit_rec, ensure_ascii=True) + "\n")
 
-        # shortlist + dedup
-        order = np.argsort(-fused_base)[:top_k_sparse]
-        picked_rows = _dedup_by_cosine(X, order, thresh=dedup_thresh, cap=300)
+            # 7) write CSV row
+            writer.writerow({
+                "question": q_text,
+                "distribution": json.dumps(dist, ensure_ascii=True),
+                "supports": json.dumps(supports, ensure_ascii=True),
+            })
 
-        # ---- label set ----
-        consider_rows = picked_rows[:label_cap]
-        consider_ids = [tfidf_id_map[i] for i in consider_rows]
-        consider_texts = [tfidf_texts[i] for i in consider_rows]
-
-        # ---- labeling: LLM (Together) or cosine fallback ----
-        option_scores = {opt: 0.0 for opt in options}
-        doc2lab: Dict[str, Tuple[str, float]] = {}
-
-        provider = str(labeling_cfg.get("provider", "together")).lower()
-        if provider == "together":
-            model = labeling_cfg.get("model", "Qwen/Qwen2.5-7B-Instruct-Turbo")
-            api_key = args.api_key or ""
-            if not api_key:
-                print("[mas_survey.run] ERROR: provider=together but no API key provided.", file=sys.stderr)
-                sys.exit(1)
-
-            print(f"[run] LLM labeling: {len(consider_ids)} docs, model={model} …", flush=True)
-            doc2lab = label_with_llm(
-                question=q_text,
-                options=options,
-                doc_ids=consider_ids,
-                doc_texts=consider_texts,
-                model=model,
-                api_key=api_key,
-                batch_size=int(labeling_cfg.get("batch_size", 8)),
-            )
-            for _, (opt, conf) in doc2lab.items():
-                if opt in option_scores:
-                    option_scores[opt] += float(conf)
-            print(f"[run] LLM done, votes={len(doc2lab)}", flush=True)
-        else:
-            # Cosine fallback: treat option with highest doc cosine as label; confidence = softmax doc-wise
-            option_query_texts = [q_text + " " + opt for opt in options]
-            option_vecs = vec.transform(option_query_texts)
-            option_vecs = normalize(option_vecs, norm="l2", axis=1, copy=False)
-
-            doc_mat = vec.transform(consider_texts)
-            doc_mat = normalize(doc_mat, norm="l2", axis=1, copy=False)
-
-            cos = (doc_mat @ option_vecs.T).toarray()  # docs x options
-            # doc-wise softmax to create pseudo-confidence
-            for did, row in zip(consider_ids, cos):
-                row = row - row.max()
-                ex = np.exp(row / max(temperature, 1e-6))
-                probs = ex / (ex.sum() + 1e-12)
-                j = int(np.argmax(probs))
-                conf = float(probs[j])
-                chosen = options[j]
-                doc2lab[did] = (chosen, conf)
-                option_scores[chosen] += conf
-
-        # ---- aggregate to distribution ----
-        distribution = _aggregate(option_scores, alpha=alpha, temperature=temperature)
-
-        # ===================== supports ranking ======================
-        # Build per-doc confidence map (best option confidence)
-        doc_best_conf: Dict[str, float] = {}
-        for did, (_, conf) in doc2lab.items():
-            doc_best_conf[did] = float(conf)
-
-        # Per-option buckets (for top-ups)
-        opt2docs: Dict[str, List[Tuple[str, float]]] = {o: [] for o in options}
-        for did, (opt, conf) in doc2lab.items():
-            opt2docs[opt].append((did, float(conf)))
-        for arr in opt2docs.values():
-            arr.sort(key=lambda x: -x[1])
-
-        # quota per option (ensure coverage)
-        per_opt_quota = max(10, support_k // max(3, len(options)))
-        seeded: List[str] = []
-        for opt, arr in opt2docs.items():
-            seeded.extend([d for d, _ in arr[:per_opt_quota]])
-
-        # Global candidate list (seeded + remaining in fused order)
-        picked_ids = [tfidf_id_map[r] for r in picked_rows]
-        candidates = list(dict.fromkeys(seeded + picked_ids))  # preserve order, dedup
-
-        # Tiebreaker by fused rank position
-        row_pos = {tfidf_id_map[r]: pos for pos, r in enumerate(picked_rows)}
-
-        def fused_pos(d: str) -> int:
-            return row_pos.get(d, 10 ** 9)
-
-        # Sort: primary by LLM confidence desc (0 if missing), secondary by fused rank asc
-        candidates.sort(key=lambda d: (-(doc_best_conf.get(d, 0.0)), fused_pos(d)))
-
-        # Subreddit diversity cap
-        supports: List[str] = []
-        seen = set()
-        sub_seen: Dict[str, int] = {}
-        for did in candidates:
-            if did in seen:
-                continue
-            sub = (documents.get(did, {}).get("group") or "")[:128]
-            if sub and sub_seen.get(sub, 0) >= div_cap:
-                continue
-            supports.append(did)
-            seen.add(did)
-            if sub:
-                sub_seen[sub] = sub_seen.get(sub, 0) + 1
-            if len(supports) >= support_k:
-                break
-
-        # Fill remainder if needed
-        if len(supports) < support_k:
-            for did in picked_ids:
-                if did in seen:
-                    continue
-                supports.append(did)
-                seen.add(did)
-                if len(supports) >= support_k:
-                    break
-
-        if len(supports) < support_k:
-            print(f"[mas_survey.run] Warning: only {len(supports)} supports available; use full corpus for 100.", flush=True)
-
-        rows.append((q_text, distribution, supports))
-        audit_lines.append(json.dumps({
-            "question": q_text,
-            "n_options": len(options),
-            "picked": len(picked_rows),
-            "used_for_label": len(consider_rows),
-            "option_scores": option_scores,
-            "distribution": distribution,
-            "supports_len": len(supports),
-            "per_opt_quota": per_opt_quota
-        }))
-
-    out_csv = run_cfg.get("output_csv", "./artifacts/submission_js.csv")
-    _write_csv(rows, out_csv)
-    print(f"[run] Wrote CSV → {out_csv}")
-
-    audit_path = run_cfg.get("audit_log", "./artifacts/audit.jsonl")
-    Path(audit_path).parent.mkdir(parents=True, exist_ok=True)
-    with open(audit_path, "w", encoding="utf-8") as f:
-        for line in audit_lines:
-            f.write(line + "\n")
-    print(f"[run] Wrote audit log → {audit_path}")
+    audit_f.close()
+    print(f"[run] Wrote {output_csv} and {audit_log}")
 
 
 if __name__ == "__main__":

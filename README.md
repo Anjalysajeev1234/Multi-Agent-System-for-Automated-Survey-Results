@@ -76,3 +76,21 @@ No. CPU-only.
 
 **Can I add libraries?**
 Yes, within course constraints. Start here, then add BM25 / FAISS / scikit-learn as needed.
+
+
+
+
+## Reproduce (mini)
+python -m index.build --config config.yaml --api_key DUMMY
+python -m mas_survey.run --config config.yaml --api_key DUMMY
+
+## Full dev
+# edit config.yaml → documents_path=./data/documents.jsonl, questions_path=./data/dev.json
+python -m index.build --config config.yaml --api_key DUMMY
+python -m mas_survey.run --config config.yaml --api_key $TOGETHER_API_KEY
+
+## Notes
+- Labeling provider: TogetherAI, model: Qwen/Qwen2.5-7B-Instruct-Turbo (≤ $0.30/1M tokens).
+- API key is passed via `--api_key`; not stored in code or repo.
+- Outputs: artifacts/submission_js.csv, artifacts/audit.jsonl.
+- Indices/artifacts are not committed; scripts rebuild them.

@@ -62,33 +62,39 @@
 #   dirichlet_alpha: 0.2
 #   temperature: 0.8
 
-seed: 42
+sseed: 42
 
 data:
-  documents_path: "./data/documents.jsonl"      # keep MINI for sanity run
+  documents_path: "./data/documents.jsonl"
   questions_path: "./data/dev.json"
-  embeddings_path: "./data/id_to_embedding.npz"      # unused in this baseline
+  embeddings_path: "./data/id_to_embedding.npz"   # unused here
 
 index:
   output_dir: "./artifacts/index"
   build_sparse: true
+  build_whoosh: true
   build_dense: false
 
+whoosh:
+  index_dir: "./artifacts/whoosh_index"
+  hits_per_query: 1200
+
 retrieval:
+  sparse_backend: "bm25"
   top_k_sparse: 800
-  use_dense: false          # <-- disable FAISS (dense)
-  rrf_k: 60                 # kept for consistency; unused when only TF-IDF
+  use_dense: false
+  rrf_k: 60
 
 filtering:
   min_tokens: 10
   dedup_sim_thresh: 0.96
 
 labeling:
-  provider: "cosine"        # <-- NO LLM
+  provider: "cosine"
   top_docs_for_label: 160
   temperature: 0.8
   dirichlet_alpha: 0.2
-  batch_size: 8             # ignored in cosine mode
+  batch_size: 8
   max_options: 12
 
 supports:
@@ -98,4 +104,3 @@ supports:
 run:
   output_csv: "./artifacts/submission_js.csv"
   audit_log: "./artifacts/audit.jsonl"
-
