@@ -237,3 +237,14 @@ __pycache__/
 # allow small evidence snapshots in reports/
 !reports/**/*.csv
 !reports/**/*.jsonl
+
+# data
+data/documents.jsonl
+data/id_to_embedding.npz
+data/mini_documents.jsonl
+data/dev_groundtruth.json
+# artifacts
+artifacts/
+# notebooks, caches
+*.ipynb
+artifacts/cache/
