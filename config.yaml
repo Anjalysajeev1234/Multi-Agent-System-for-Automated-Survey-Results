@@ -46,18 +46,18 @@ whoosh:
 # =============== Retrieval ===========================
 retrieval:
   # Use BM25 if available; fallback to TF-IDF if Whoosh missing
-  sparse_backend: "bm25"        # "bm25" | "tfidf" | "both"
-  top_k_sparse: 1000            # size for fused shortlist before dedup
-  min_candidates: 300   
+  sparse_backend: "both"        # "bm25" | "tfidf" | "both"
+  top_k_sparse: 800           # size for fused shortlist before dedup
+  min_candidates: 160   
           # if fewer retrieved, we do a bounded TF-IDF fallback
-  fanout: false
+  fanout: true
   # Fusion across [question] + [question + each option]
-  fusion: "rrf"
+  fusion: "single"
   rrf_k: 60
 
 # =============== Filtering / Dedup ====================
 filtering:
-  dedup_sim_thresh: 0.985       # TF-IDF cosine threshold for near-duplicate removal
+  dedup_sim_thresh: 0.99      # TF-IDF cosine threshold for near-duplicate removal
 
 # =============== Labeling (stance) ====================
 labeling:
@@ -80,6 +80,6 @@ supports:
 
 # =============== Run / Outputs ========================
 run:
-  output_csv: "./artifacts/submission_js_dev_irA_bm25_single.csv"    # change to *_test.csv for test runs
-  audit_log: "./artifacts/audit_dev_irA_bm25_single.jsonl"           # change to *_test.jsonl for test runs #
+  output_csv: "./artifacts/submission_js_dev_irA_tfidf_only.csv"    # change to *_test.csv for test runs
+  audit_log: "./artifacts/audit_dev_irA_tfidf_single.jsonl"           # change to *_test.jsonl for test runs #
   per_question_time_cap_sec: 0.0                     # 0 disables; set e.g. 20.0 if you want a guardrail
