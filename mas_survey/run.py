@@ -1,230 +1,170 @@
 # mas_survey/run.py
 from __future__ import annotations
-import argparse, csv, json, random, time, re
+import argparse, csv, json, time, yaml
 from pathlib import Path
 from typing import Dict, List, Tuple
 
-import numpy as np
-import yaml
-from sklearn.feature_extraction.text import TfidfVectorizer
-
-from mas_survey.retrieval import load_tfidf, Indices, retrieve_candidates
-from mas_survey.llm_stance import label_with_llm
+from mas_survey.retrieval import Indices, load_tfidf, retrieve_candidates
+from mas_survey.llm_stance import label_with_llm, together_health_check
 from mas_survey.aggregate import aggregate_votes, select_supports
 
 
-def _set_seed(seed: int):
-    random.seed(seed); np.random.seed(seed)
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Run MAS pipeline")
+    p.add_argument("--config", type=str, default="config.yaml",
+                   help="Path to config.yaml (default: config.yaml)")
+    p.add_argument("--api_key", type=str, default=None,
+                   help="API key (forwarded to Together when labeling=llm).")
+    return p.parse_args()
 
 
-def _load_docs_map(documents_path: str) -> Dict[str, str]:
-    mp: Dict[str, str] = {}
-    with open(documents_path, "r", encoding="utf-8") as f:
-        for line in f:
-            o = json.loads(line)
-            did = str(o["id"])
-            title = o.get("title") or ""
-            desc = o.get("description") or ""
-            pc = o.get("post_content") or ""
-            content = o.get("content") or ""
-            mp[did] = "\n".join([x for x in [title, desc, pc, content] if x]).strip()
-    return mp
+def _read_docs(path: Path) -> Dict[str, dict]:
+    out: Dict[str, dict] = {}
+    with path.open("r", encoding="utf-8") as f:
+        for ln in f:
+            ln = ln.strip()
+            if not ln:
+                continue
+            try:
+                obj = json.loads(ln)
+                did = obj.get("id")
+                if did:
+                    out[did] = obj
+            except Exception:
+                continue
+    return out
 
 
-def _load_questions(path: str) -> Dict[str, dict]:
-    return json.loads(open(path, "r", encoding="utf-8").read())
+def _doc_text(obj: dict) -> str:
+    title = obj.get("title") or ""
+    desc = obj.get("description") or ""
+    pc = obj.get("post_content") or ""
+    content = obj.get("content") or ""
+    return "\n".join([t for t in (title, desc, pc, content) if t]).strip()
 
 
-def _audit_write(audit_path: Path, obj: dict):
-    with audit_path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(obj, ensure_ascii=True) + "\n")
+def _snippet(text: str, max_chars: int = 550) -> str:
+    t = " ".join((text or "").split())
+    return (t[:max_chars] + " ...") if len(t) > max_chars else t
 
 
-def _split_sents(txt: str) -> List[str]:
-    # crude sentence split, fast & deterministic
-    return re.split(r'(?<=[.!?])\s+', (txt or "").strip())
-
-
-def _build_vocab_vectorizer(vocab: Dict[str, int]) -> TfidfVectorizer:
-    tv = TfidfVectorizer(vocabulary=vocab, lowercase=True, token_pattern=r"(?u)\b\w\w+\b")
-    # hack-fit to enable transform; fit on dummy corpus of vocab tokens
-    tv.fit([" ".join(vocab.keys())])
-    return tv
-
-
-def _best_snippet(txt: str, tv: TfidfVectorizer, top_k_terms: int = 10, max_sent: int = 3) -> str:
-    sents = _split_sents(txt)[:14]  # limit to 14 sentences
-    if not sents:
-        return ""
-    Xs = tv.transform(sents).tocsr()
-    # pseudo-query: top vocab tokens (stable proxy for matching)
-    # (we could also build from question terms; this keeps it general + fast)
-    qs = tv.transform([" ".join(list(tv.vocabulary_.keys())[:top_k_terms])])
-    sims = (qs @ Xs.T).A.ravel()
-    idx = np.argsort(-sims)[:max_sent]
-    return " ".join(sents[i] for i in idx)
-
-
-def main():
-    ap = argparse.ArgumentParser(description="Run MAS pipeline (BM25 per-option + snippets + LLM).")
-    ap.add_argument("--config", type=str, default="config.yaml")
-    ap.add_argument("--api_key", type=str, default=None, help="Together API key if using LLM.")
-    args = ap.parse_args()
-
+def main() -> None:
+    args = parse_args()
     cfg = yaml.safe_load(open(args.config, "r", encoding="utf-8"))
-    _set_seed(int(cfg.get("seed", 42)))
 
-    # load indices
-    index_dir = Path(cfg["index"]["output_dir"])
-    tfidf_X, vocab, row_id_map = load_tfidf(index_dir)
-    whoosh_dir = Path(cfg["whoosh"]["index_dir"]) if Path(cfg["whoosh"]["index_dir"]).exists() else None
-    faiss_index_path = index_dir / "faiss.index"
-    if not faiss_index_path.exists():
-        faiss_index_path = None
-
-    idx = Indices(
-        tfidf_X=tfidf_X, vocab=vocab, row_id_map=row_id_map,
-        whoosh_dir=whoosh_dir,
-        faiss_index_path=faiss_index_path,
-    )
-
-    docs_map = _load_docs_map(cfg["data"]["documents_path"])
-    corpus_all_ids = sorted(docs_map.keys())  # deterministic fallback pool
-
-    questions = _load_questions(cfg["data"]["questions_path"])
-
+    docs_path = Path(cfg["data"]["documents_path"])
+    q_path = Path(cfg["data"]["questions_path"])
     out_csv = Path(cfg["run"]["output_csv"])
-    audit_path = Path(cfg["run"]["audit_log"])
+    audit_log = Path(cfg["run"]["audit_log"])
     out_csv.parent.mkdir(parents=True, exist_ok=True)
-    audit_path.parent.mkdir(parents=True, exist_ok=True)
-    if audit_path.exists():
-        audit_path.unlink()
+    audit_log.parent.mkdir(parents=True, exist_ok=True)
 
-    provider = cfg["labeling"]["provider"]
-    llm_model = cfg["labeling"]["model"]
-    batch_size = int(cfg["labeling"]["batch_size"])
-    max_output_tokens = int(cfg["labeling"]["max_output_tokens"])
-    temperature = float(cfg["labeling"]["temperature"])
+    # Load docs & questions
+    docs = _read_docs(docs_path)
+    questions = json.load(open(q_path, "r", encoding="utf-8"))
+    print(f"[run] loaded {len(docs)} docs from {docs_path}")
+    print(f"[run] loaded {len(questions)} questions from {q_path}")
 
-    dirichlet_alpha = float(cfg["calibration"]["dirichlet_alpha"])
-    temp_cal = float(cfg["calibration"]["temperature"])
+    # Load indices built by index.build
+    tfidf_X, vocab, row_id_map = load_tfidf(Path(cfg["index"]["output_dir"]))
+    whoosh_dir = Path(cfg["whoosh"]["index_dir"]) if cfg["index"].get("build_whoosh", True) else None
+    idx = Indices(tfidf_X=tfidf_X, vocab=vocab, row_id_map=row_id_map, whoosh_dir=whoosh_dir)
+    print(f"[run] tfidf rows={tfidf_X.shape[0]} cols={tfidf_X.shape[1]} | whoosh_dir={whoosh_dir}")
 
-    supports_k = int(cfg["supports"]["size"])
-    per_q_cap = float(cfg["run"].get("per_question_time_cap_sec", 0.0))
-
-    # TF-IDF vectorizer for snippet scoring
-    tv = _build_vocab_vectorizer(vocab)
-
-    with out_csv.open("w", encoding="utf-8", newline="") as fcsv:
-        writer = csv.writer(fcsv)
-        writer.writerow(["question", "distribution", "supports"])
-
-        for q_idx, (q_text, q_obj) in enumerate(questions.items(), 1):
-            options = list(q_obj["distribution"].keys())
-            t0 = time.time()
-
-            # === retrieval: BM25 fan-out + RRF + dedup ===
-            cand_ids = retrieve_candidates(
-                question=q_text,
-                options_for_q=options,
-                cfg=cfg,
-                idx=idx,
-                docid2text=docs_map,
+    # If provider==llm, proactively health-check Together
+    provider = str(cfg["labeling"]["provider"]).lower()
+    model = cfg["labeling"]["model"] if provider == "llm" else None
+    if provider == "llm":
+        assert args.api_key, "LLM provider selected but no --api_key given"
+        print(f"[run] LLM labeling ENABLED -> model={model}, batch={cfg['labeling']['batch_size']}")
+        try:
+            ok = together_health_check(
+                model=model,
+                api_key=args.api_key or "",
+                timeout_tokens=8,
             )
+            print(f"[run] Together health-check: {ok}")
+        except Exception as e:
+            raise SystemExit(f"[run] Together health-check FAILED: {e}")
 
-            # bounded fallback: if too few, add one TF-IDF pass and merge
-            if len(cand_ids) < supports_k:
-                cfg2 = dict(cfg)
-                cfg2["retrieval"] = dict(cfg["retrieval"])
-                cfg2["retrieval"]["sparse_backend"] = "tfidf"
-                extra = retrieve_candidates(q_text, options, cfg2, idx, docs_map)
-                seen = set(cand_ids)
-                for did in extra:
-                    if did not in seen:
-                        cand_ids.append(did); seen.add(did)
+    # Writers
+    with out_csv.open("w", encoding="utf-8", newline="") as fw, audit_log.open("w", encoding="utf-8") as flog:
+        writer = csv.DictWriter(fw, fieldnames=["question", "distribution", "supports"])
+        writer.writeheader()
 
-            # prepare texts for labeling (top precision chunk)
-            L = int(cfg["labeling"]["top_docs_for_label"])
-            label_ids = cand_ids[:L]
+        for qi, (qtext, qmeta) in enumerate(questions.items(), start=1):
+            t0 = time.time()
+            options: List[str] = list(qmeta["distribution"].keys())
+            print(f"\n[run] Q{qi}/{len(questions)}: options={len(options)}  '{qtext[:110]}{'...' if len(qtext)>110 else ''}'")
 
-            # --- snippets (2–3 best sentences) ---
-            label_texts = [_best_snippet(docs_map.get(d, ""), tv) for d in label_ids]
+            # 1) retrieve
+            cand_ids: List[str] = retrieve_candidates(qtext, options, cfg, idx)
+            print(f"[run] retrieved candidates={len(cand_ids)} (deduped)")
 
-            # === labeling ===
+            # 2) label with LLM (or fallback)
+            topN = int(cfg["labeling"]["top_docs_for_label"])
+            label_ids = cand_ids[:topN]
+            votes: Dict[str, Tuple[str, float]] = {}
+
             if provider == "llm":
-                if not args.api_key:
-                    raise RuntimeError("LLM labeling selected but no --api_key provided.")
-                doc2vote = label_with_llm(
-                    question=q_text,
+                snippets = [_snippet(_doc_text(docs.get(did, {}))) for did in label_ids]
+                votes = label_with_llm(
+                    question=qtext,
                     options=options,
                     doc_ids=label_ids,
-                    doc_texts=label_texts,
-                    model=llm_model,
-                    api_key=args.api_key,
-                    batch_size=batch_size,
-                    temperature=temperature,
-                    max_output_tokens=max_output_tokens,
+                    doc_texts=snippets,
+                    model=model,
+                    api_key=args.api_key or "",
+                    batch_size=int(cfg["labeling"]["batch_size"]),
+                    temperature=float(cfg["labeling"]["temperature"]),
+                    max_output_tokens=int(cfg["labeling"]["max_output_tokens"]),
                 )
-                parse_success = sum(1 for v in doc2vote.values() if v[0] in options)
-                # confidence shaping with rank weights
-                rank_weight = np.linspace(1.0, 0.6, num=max(1, len(label_ids)))
-                for i, did in enumerate(label_ids):
-                    if did in doc2vote:
-                        opt, conf = doc2vote[did]
-                        doc2vote[did] = (opt, float(0.5*conf + 0.5*rank_weight[i]))
+                parse_success = sum(1 for (opt, _) in votes.values() if opt in options)
+                print(f"[run] LLM parse success: {parse_success}/{len(label_ids)}")
             else:
-                # cosine-only fallback: assign option[0] with a rank-decay confidence
-                doc2vote = {}
-                confs = np.linspace(1.0, 0.6, num=max(1, len(label_ids)))
-                for did, c in zip(label_ids, confs):
-                    doc2vote[did] = (options[0], float(c))
-                parse_success = len(label_ids)
+                # simple baseline: assign weak decaying weight to first option
+                for i, did in enumerate(label_ids, start=1):
+                    votes[did] = (options[0], max(0.05, 1.0 / (i + 10.0)))
+                parse_success = len(label_ids)  # by construction
 
-            # === aggregate ===
+            # 3) aggregate/calibrate
             dist = aggregate_votes(
                 options=options,
-                doc2vote=doc2vote,
-                dirichlet_alpha=dirichlet_alpha,
-                temperature=temp_cal,
+                votes=votes,
+                rank_ids=label_ids,
+                temperature=float(cfg["calibration"]["temperature"]),
+                dirichlet_alpha=float(cfg["calibration"]["dirichlet_alpha"]),
             )
-            # strict renorm and safety
-            s = sum(dist.values()) or 1.0
-            dist = {k: max(0.0, v) for k, v in dist.items()}
-            s = sum(dist.values()) or 1.0
-            dist = {k: v / s for k, v in dist.items()}
+            # quick sanity: sum to ~1.0
+            s = sum(dist.values())
+            if not (0.999999 <= s <= 1.000001):
+                print(f"[run][warn] distribution sum={s:.8f} (will still write)")
 
-            # === supports (exactly 100) ===
+            # 4) supports (exactly N)
             supports = select_supports(
-                ranked_unique_ids=cand_ids[:supports_k*3],   # prioritize same-query pool
-                required_k=supports_k,
-                all_candidates_fallback=cand_ids,
-                corpus_all_ids=corpus_all_ids,               # rarely needed now
+                fused_rank=cand_ids,
+                size=int(cfg["supports"]["size"]),
+                all_candidates_fallback=idx.row_id_map,  # deterministic padding
             )
 
-            # === write row ===
-            dist_json = json.dumps(dist, ensure_ascii=True)
-            supports_json = json.dumps(supports, ensure_ascii=True)
-            writer.writerow([q_text, dist_json, supports_json])
-
-            # === audit ===
-            dt = time.time() - t0
-            _audit_write(audit_path, {
-                "question_idx": q_idx,
-                "question": q_text[:200],
-                "n_candidates": len(cand_ids),
-                "n_labeled": len(label_ids),
-                "parse_success": int(parse_success),
-                "provider": provider,
-                "whoosh": bool(whoosh_dir is not None),
-                "used_dense": False,  # query embeddings not built
-                "time_sec": round(dt, 3),
+            # write row + audit
+            writer.writerow({
+                "question": qtext,
+                "distribution": json.dumps(dist, ensure_ascii=True),
+                "supports": json.dumps(supports, ensure_ascii=True),
             })
+            flog.write(json.dumps({
+                "question": qtext,
+                "provider": provider,
+                "model": model if provider == "llm" else None,
+                "n_candidates": len(cand_ids),
+                "labeled": len(label_ids),
+                "llm_parse_success": parse_success if provider == "llm" else None,
+                "supports_len": len(supports),
+                "elapsed_sec": round(time.time() - t0, 3),
+            }) + "\n")
 
-            if per_q_cap > 0 and dt > per_q_cap:
-                print(f"[run] Time cap exceeded for a question ({dt:.2f}s > {per_q_cap:.2f}s). Continuing...")
-
-    print(f"[run] Wrote {out_csv}")
-    print(f"[run] Audit at {audit_path}")
+    print(f"\n[run] Wrote {out_csv} and audit {audit_log}")
 
 
 if __name__ == "__main__":

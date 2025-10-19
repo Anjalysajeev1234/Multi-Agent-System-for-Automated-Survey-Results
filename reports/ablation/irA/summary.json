@@ -1,0 +1,7 @@
+{
+  "experiment": "A1 - Fanout ablation",
+  "baseline_fanout_on_js": 0.30641,
+  "variant_fanout_off_js": 0.30087,
+  "delta_js": -0.00554,
+  "notes": "BM25+TFIDF with RRF; dedup=0.96; other settings fixed."
+}

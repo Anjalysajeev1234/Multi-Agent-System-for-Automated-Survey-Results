@@ -1,150 +1,240 @@
 # mas_survey/retrieval.py
+# Python 3.9 compatible
 from __future__ import annotations
+
 import json
-from dataclasses import dataclass
+import math
+import re
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
+
 import numpy as np
-from scipy import sparse
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.preprocessing import normalize
+from scipy.sparse import csr_matrix
+from sklearn.metrics.pairwise import cosine_similarity
 
-WHOOSH_OK, FAISS_OK = True, True
+# ---- Optional Whoosh imports
 try:
-    from whoosh import index as windex
-    from whoosh.qparser import QueryParser
+    from whoosh.index import open_dir as whoosh_open_dir
+    from whoosh.qparser import MultifieldParser, OrGroup
+    HAVE_WHOOSH = True
 except Exception:
-    WHOOSH_OK = False
-try:
-    import faiss  # type: ignore
-except Exception:
-    FAISS_OK = False
+    HAVE_WHOOSH = False
 
 
-@dataclass
+# -------------------------------------------------------------------
+# Index container
+# -------------------------------------------------------------------
 class Indices:
-    tfidf_X: sparse.csr_matrix
-    vocab: Dict[str, int]
-    row_id_map: List[str]
-    whoosh_dir: Optional[Path]
-    faiss_index_path: Optional[Path]
+    def __init__(
+        self,
+        *,
+        tfidf_X: csr_matrix,
+        vocab: Dict[str, int],
+        row_id_map: List[str],
+        whoosh_dir: Optional[Path] = None,
+    ):
+        self.tfidf_X = tfidf_X
+        self.vocab = vocab
+        self.row_id_map = row_id_map                 # row -> doc_id
+        self.id2row = {d: i for i, d in enumerate(row_id_map)}
+        self.whoosh_dir = whoosh_dir if whoosh_dir and whoosh_dir.exists() else None
+
+        self._windex = None
+        if HAVE_WHOOSH and self.whoosh_dir:
+            try:
+                self._windex = whoosh_open_dir(str(self.whoosh_dir))
+            except Exception:
+                self._windex = None
 
 
-def load_tfidf(index_dir: Path) -> Tuple[sparse.csr_matrix, Dict[str, int], List[str]]:
-    X = sparse.load_npz(index_dir / "tfidf_index.npz").tocsr().astype(np.float32)
-    meta = json.loads((index_dir / "tfidf_vocab.json").read_text(encoding="utf-8"))
-    vocab = {k: int(v) for k, v in meta["vocabulary"].items()}
-    row_id_map = json.loads((index_dir / "tfidf_id_map.json").read_text(encoding="utf-8"))
+# -------------------------------------------------------------------
+# Load TF-IDF artifacts produced by index.build
+# Accepts both id_map.json and tfidf_id_map.json
+# -------------------------------------------------------------------
+def load_tfidf(outdir: Path) -> Tuple[csr_matrix, Dict[str, int], List[str]]:
+    m = np.load(str(outdir / "tfidf_index.npz"))
+    X = csr_matrix((m["data"], m["indices"], m["indptr"]), shape=tuple(m["shape"]))
+
+    meta = json.loads((outdir / "tfidf_vocab.json").read_text(encoding="utf-8"))
+    vocab = {str(k): int(v) for k, v in meta["vocabulary"].items()}
+
+    id_map_path = outdir / "id_map.json"
+    if not id_map_path.exists():
+        alt = outdir / "tfidf_id_map.json"
+        if alt.exists():
+            id_map_path = alt
+        else:
+            raise FileNotFoundError(f"Missing id map: {id_map_path} or {alt}")
+
+    row_id_map = json.loads(id_map_path.read_text(encoding="utf-8"))
     return X, vocab, row_id_map
 
 
-def build_query_vector(text: str, vocab: Dict[str, int]) -> sparse.csr_matrix:
-    tv = TfidfVectorizer(
-        lowercase=True, ngram_range=(1,1),
-        token_pattern=r"(?u)\b\w\w+\b",
-        vocabulary=vocab,
-        dtype=np.float32, use_idf=False, norm=None
-    )
-    qX = tv.fit_transform([text]).astype(np.float32)
-    qX = normalize(qX, norm="l2", axis=1, copy=False)
-    return qX
+# -------------------------------------------------------------------
+# Query prep helpers
+# -------------------------------------------------------------------
+_SPLIT_RE = re.compile(r"\s*//\s*")
+_PUNCT_RE = re.compile(r"[^\w\s]+")
+
+def _clean(s: str) -> str:
+    s = s or ""
+    # Take the clause before ' // ' to avoid super long, noisy tails
+    s = _SPLIT_RE.split(s, maxsplit=1)[0].lower().strip()
+    s = _PUNCT_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _mk_queries(question: str, options: List[str], fanout: bool) -> List[str]:
+    root = _clean(question)
+    qs = [root]
+    if fanout:
+        for o in options:
+            oo = _clean(o)
+            if oo and oo not in qs:
+                qs.append(f"{root} {oo}")
+    # tiny domain heuristic to broaden some topics
+    if "immigr" in root:
+        qs.append(root + " united states america US values opinions")
+    if "priority" in root and "immigr" in root:
+        qs.append(root + " policy support should priority immigration")
+    return qs
 
 
-def cosine_topk(q: sparse.csr_matrix, X: sparse.csr_matrix, k: int) -> Tuple[np.ndarray, np.ndarray]:
-    sims = (q @ X.T).toarray().ravel()
-    if k >= sims.shape[0]:
-        idx = np.argsort(-sims)
-    else:
-        idx = np.argpartition(-sims, k)[:k]
-        idx = idx[np.argsort(-sims[idx])]
-    return idx, sims[idx]
-
-
-def whoosh_search_list(wdir: Path, texts: List[str], hits: int) -> List[List[str]]:
-    if not WHOOSH_OK or not windex.exists_in(str(wdir)):
-        return [[] for _ in texts]
-    ix = windex.open_dir(str(wdir))
-    qp = QueryParser("text", schema=ix.schema)
-    out: List[List[str]] = []
-    with ix.searcher() as s:
-        for t in texts:
-            q = qp.parse(t)
-            out.append([hit["id"] for hit in s.search(q, limit=hits)])
+# -------------------------------------------------------------------
+# Whoosh BM25 search (optional)
+# -------------------------------------------------------------------
+def _whoosh_search(idx: Indices, queries: List[str], hits_per_query: int) -> List[Tuple[str, float]]:
+    if not (HAVE_WHOOSH and idx._windex):
+        return []
+    out: List[Tuple[str, float]] = []
+    with idx._windex.searcher() as searcher:
+        parser = MultifieldParser(
+            ["title", "description", "post_content", "content"],
+            schema=idx._windex.schema,
+            group=OrGroup,
+        )
+        for q in queries:
+            try:
+                qobj = parser.parse(q)
+                res = searcher.search(qobj, limit=hits_per_query)
+                for hit in res:
+                    did = hit.get("id")
+                    if did:
+                        out.append((did, float(hit.score)))
+            except Exception:
+                continue
     return out
 
 
-def load_faiss(path: Path):
-    if not FAISS_OK or not path or not path.exists():
-        return None
-    return faiss.read_index(str(path))
+# -------------------------------------------------------------------
+# TF-IDF cosine ranking (always available)
+# -------------------------------------------------------------------
+def _tfidf_rank(idx: Indices, queries: List[str], top_k: int) -> List[Tuple[str, float]]:
+    if idx.tfidf_X.shape[0] == 0:
+        return []
+    def qvec(q: str) -> csr_matrix:
+        toks = q.split()
+        cols = [idx.vocab[t] for t in toks if t in idx.vocab]
+        if not cols:
+            return csr_matrix((1, idx.tfidf_X.shape[1]), dtype=np.float32)
+        data = np.ones(len(cols), dtype=np.float32)
+        rows = np.zeros(len(cols), dtype=np.int32)
+        return csr_matrix((data, (rows, np.array(cols))), shape=(1, idx.tfidf_X.shape[1]), dtype=np.float32)
 
-
-def rrf_fuse(ranklists: List[List[str]], k: int = 60, limit: int = 1000) -> List[str]:
-    scores: Dict[str, float] = {}
-    for rl in ranklists:
-        for r, did in enumerate(rl, start=1):
-            scores[did] = scores.get(did, 0.0) + 1.0 / (k + r)
-    out = sorted(scores.items(), key=lambda x: -x[1])
-    return [did for did, _ in out[:limit]]
-
-
-def dedup_by_tfidf_cosine(candidates: List[str], id2row: Dict[str, int], X: sparse.csr_matrix, thresh: float) -> List[str]:
-    keep: List[str] = []
-    rows: List[int] = []
-    for did in candidates:
-        r = id2row.get(did)
-        if r is None:
+    scores = np.zeros(idx.tfidf_X.shape[0], dtype=np.float32)
+    for q in queries:
+        v = qvec(_clean(q))
+        if v.nnz == 0:
             continue
-        xr = X[r]
-        ok = True
-        for kept_r in rows:
-            sim = (xr @ X[kept_r].T).A[0, 0]
-            if sim >= thresh:
-                ok = False
+        cs = cosine_similarity(v, idx.tfidf_X, dense_output=False)  # 1 x N
+        scores += np.asarray(cs.todense()).ravel().astype(np.float32)
+
+    if float(scores.max(initial=0.0)) <= 0.0:
+        return []
+    top = np.argpartition(-scores, min(top_k, len(scores)-1))[:top_k]
+    top = top[np.argsort(-scores[top])]
+    return [(idx.row_id_map[i], float(scores[i])) for i in top]
+
+
+# -------------------------------------------------------------------
+# Fusion & de-dup
+# -------------------------------------------------------------------
+def _rrf_fuse(runs: List[List[Tuple[str, float]]], k: int = 60) -> List[Tuple[str, float]]:
+    agg: Dict[str, float] = {}
+    for run in runs:
+        for rnk, (did, _) in enumerate(run):
+            agg[did] = agg.get(did, 0.0) + 1.0 / (k + (rnk + 1))
+    return sorted(agg.items(), key=lambda x: -x[1])
+
+def _dedup_by_tfidf(idx: Indices, ranked_ids: List[str], cos_thresh: float, cap: Optional[int]) -> List[str]:
+    keep: List[str] = []
+    seen_rows: List[int] = []
+    for did in ranked_ids:
+        row = idx.id2row.get(did)
+        if row is None:
+            continue
+        v = idx.tfidf_X[row]
+        dup = False
+        for r in seen_rows:
+            if cosine_similarity(v, idx.tfidf_X[r])[0, 0] >= cos_thresh:
+                dup = True
                 break
-        if ok:
+        if not dup:
             keep.append(did)
-            rows.append(r)
+            seen_rows.append(row)
+            if cap and len(keep) >= cap:
+                break
     return keep
 
 
-def retrieve_candidates(
-    question: str,
-    options_for_q: List[str],
-    cfg: dict,
-    idx: Indices,
-    docid2text: Dict[str, str],
-) -> List[str]:
-    """
-    Retrieval with:
-      - BM25 fan-out: [question] + [question + option_i] for each option
-      - RRF fusion
-      - TF-IDF cosine dedup
-    """
-    hits = int(cfg["whoosh"]["hits_per_query"])
-    backend = cfg["retrieval"]["sparse_backend"]
-    rrf_k = int(cfg["retrieval"]["rrf_k"])
-    min_cand = int(cfg["retrieval"]["min_candidates"])
+# -------------------------------------------------------------------
+# Public API: build indices handle and retrieve candidates
+# -------------------------------------------------------------------
+def build_indices(cfg: dict) -> Indices:
+    outdir = Path(cfg["index"]["output_dir"])
+    tfidf_X, vocab, row_id_map = load_tfidf(outdir)
+    whoosh_dir = Path(cfg.get("whoosh", {}).get("index_dir", "")) if cfg.get("whoosh") else None
+    return Indices(tfidf_X=tfidf_X, vocab=vocab, row_id_map=row_id_map, whoosh_dir=whoosh_dir)
 
-    # Build ranklists
-    ranklists: List[List[str]] = []
+def retrieve_candidates(question: str, options: List[str], cfg: dict, idx: Indices) -> List[str]:
+    fanout = bool(cfg.get("retrieval", {}).get("fanout", True))
+    queries = _mk_queries(question, options, fanout)
 
-    # A) sparse BM25 (preferred)
-    if backend in ("bm25", "both") and idx.whoosh_dir:
-        q_texts = [question] + [f"{question} {opt}" for opt in options_for_q]
-        ranklists = whoosh_search_list(idx.whoosh_dir, q_texts, hits)
+    hits_per_query = int(cfg.get("whoosh", {}).get("hits_per_query", 600))
+    top_k_sparse  = int(cfg.get("retrieval", {}).get("top_k_sparse", 600))
+    min_cands     = int(cfg.get("retrieval", {}).get("min_candidates", 160))
+    rrf_k         = int(cfg.get("retrieval", {}).get("rrf_k", 60))
+    dedup_t       = float(cfg.get("filtering", {}).get("dedup_sim_thresh", 0.96))
 
-    # B) fallback TF-IDF if BM25 unavailable
-    if not ranklists or all(len(rl) == 0 for rl in ranklists):
-        if backend in ("tfidf", "both"):
-            qX = build_query_vector(question, idx.vocab)
-            rows, _ = cosine_topk(qX, idx.tfidf_X, int(cfg["retrieval"]["top_k_sparse"]))
-            ranklists = [[idx.row_id_map[i] for i in rows]]
+    runs: List[List[Tuple[str, float]]] = []
 
-    # Fuse
-    fused = rrf_fuse(ranklists, k=rrf_k, limit=max(min_cand, int(cfg["retrieval"]["top_k_sparse"])))
+    # BM25 (if available)
+    bm25 = _whoosh_search(idx, queries, hits_per_query) if idx._windex is not None else []
+    if bm25:
+        runs.append(bm25[:top_k_sparse])
 
-    # Dedup
-    id2row = {d: i for i, d in enumerate(idx.row_id_map)}
-    deduped = dedup_by_tfidf_cosine(fused, id2row, idx.tfidf_X, float(cfg["filtering"]["dedup_sim_thresh"]))
-    return deduped
+    # TF-IDF cosine (always)
+    tfidf = _tfidf_rank(idx, queries, top_k_sparse)
+    if tfidf:
+        runs.append(tfidf[:top_k_sparse])
+
+    # If nothing at all, return a deterministic slice so downstream never breaks
+    if all(len(r) == 0 for r in runs):
+        return idx.row_id_map[:min_cands]
+
+    fused = _rrf_fuse(runs, k=rrf_k)
+    fused_ids = [did for did, _ in fused]
+
+    deduped = _dedup_by_tfidf(idx, fused_ids, cos_thresh=dedup_t, cap=top_k_sparse)
+
+    # Guarantee minimum by padding with TF-IDF order
+    if len(deduped) < min_cands:
+        for did, _ in tfidf:
+            if did not in deduped:
+                deduped.append(did)
+                if len(deduped) >= min_cands:
+                    break
+
+    # Return a capped but sufficient list
+    final_cap = max(min_cands, top_k_sparse)
+    return deduped[:final_cap]
