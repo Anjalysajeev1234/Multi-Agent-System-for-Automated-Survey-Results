@@ -5,8 +5,8 @@ seed: 42
 
 # -------- DEV (use with dev_groundtruth.json for local eval) --------
 data:
-  documents_path: "./data/documents.jsonl"
-  questions_path: "./data/dev.json"          # switch to test.json for final run
+  documents_path: "./data/mini_documents.jsonl"
+  questions_path: "./data/mini_dev.json"          # switch to test.json for final run
   embeddings_path: "./data/id_to_embedding.npz"   # optional; not used for queries yet
 
 # -------- TEST (10 questions, final/private) --------
@@ -80,6 +80,6 @@ supports:
 
 # =============== Run / Outputs ========================
 run:
-  output_csv: "./artifacts/submission_js_dev_irA_tfidf_only.csv"    # change to *_test.csv for test runs
-  audit_log: "./artifacts/audit_dev_irA_tfidf_single.jsonl"           # change to *_test.jsonl for test runs #
+  output_csv: "./artifacts/submission.csv"    # change to *_test.csv for test runs
+  audit_log: "./artifacts/audit.jsonl"           # change to *_test.jsonl for test runs #
   per_question_time_cap_sec: 0.0                     # 0 disables; set e.g. 20.0 if you want a guardrail
