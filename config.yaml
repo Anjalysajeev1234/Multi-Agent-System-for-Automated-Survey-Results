@@ -1,85 +1,60 @@
-# =============== General =================
+# ======= FAST MINI RUN (≈1 min) =======
 seed: 42
 
-# Pick ONE block below by uncommenting. Keep the other commented for safety.
-
-# -------- DEV (use with dev_groundtruth.json for local eval) --------
 data:
   documents_path: "./data/mini_documents.jsonl"
-  questions_path: "./data/mini_dev.json"          # switch to test.json for final run
-  embeddings_path: "./data/id_to_embedding.npz"   # optional; not used for queries yet
+  questions_path: "./data/mini_dev.json"
+  embeddings_path: "./data/id_to_embedding.npz"   # unused in this fast config
 
-# -------- TEST (10 questions, final/private) --------
-# data:
-#   documents_path: "./data/documents.jsonl"
-#   questions_path: "./data/test.json"
-#   embeddings_path: "./data/id_to_embedding.npz"
-
-# =============== Index build ===============
 index:
   output_dir: "./artifacts/index"
   force_rebuild: false
 
-  # Sparse TF-IDF (always built; used for cosine & dedup)
+  # Build only TF-IDF (fast). Disable Whoosh & FAISS for speed.
   build_sparse: true
-
-  # Whoosh BM25 (recommended). Build once, then reused.
-  build_whoosh: true
+  build_whoosh: false
   whoosh_index_dir: "./artifacts/whoosh_index"
-
-  # Dense FAISS (optional; not used for queries in this config)
   build_dense: false
-  faiss_type: "hnsw"          # "flat" | "hnsw" (ignored if build_dense=false)
+  faiss_type: "flat"
 
-# =============== TF-IDF settings (for index + scoring) ===============
 tfidf:
   ngram_min: 1
   ngram_max: 1
-  max_features: 80000
-  min_df: 2
+  max_features: 20000     # smaller = faster on mini
+  min_df: 1
 
-# =============== Whoosh settings (BM25) ===============
 whoosh:
   index_dir: "./artifacts/whoosh_index"
-  hits_per_query: 800           # per fan-out query
+  hits_per_query: 200     # ignored when build_whoosh=false
 
-# =============== Retrieval ===========================
 retrieval:
-  # Use BM25 if available; fallback to TF-IDF if Whoosh missing
-  sparse_backend: "both"        # "bm25" | "tfidf" | "both"
-  top_k_sparse: 800           # size for fused shortlist before dedup
-  min_candidates: 160   
-          # if fewer retrieved, we do a bounded TF-IDF fallback
-  fanout: true
-  # Fusion across [question] + [question + each option]
-  fusion: "single"
-  rrf_k: 60
+  sparse_backend: "tfidf" # fastest path
+  fanout: true           # single query only (fewer calls, faster)
+  fusion: "single"        # no RRF when not needed
+  top_k_sparse: 120       # shortlist size before dedup (keep small)
+  min_candidates: 60
 
-# =============== Filtering / Dedup ====================
 filtering:
-  dedup_sim_thresh: 0.99      # TF-IDF cosine threshold for near-duplicate removal
+  dedup_sim_thresh: 0.985  # quick near-dup prune
 
-# =============== Labeling (stance) ====================
 labeling:
   provider: "llm"
   model: "Qwen/Qwen2.5-7B-Instruct-Turbo"
-  batch_size: 6
-  max_output_tokens: 512
-  temperature: 0.1
-  top_docs_for_label: 160
-      # only label the top-precision subset
+  batch_size: 4
+  max_output_tokens: 256
+  temperature: 0.2
+  top_docs_for_label: 10
 
-# =============== Calibration ==========================
+
 calibration:
-  dirichlet_alpha: 0.1        # smoothing on option counts
-  temperature: 0.6            # softens over-confidence
+  dirichlet_alpha: 0.2
+  temperature: 0.9
 
-# =============== Supports =============================
 supports:
-  size: 100                     # MUST be exactly 100 unique IDs per question
+  size: 100                # <= mini has 50 docs; pick 50 to avoid padding work , 100 for documents.json
 
-# =============== Run / Outputs ========================
+
 run:
-  output_csv: "./artifacts/submission.csv"    # change to *_test.csv for test runs
-  audit_log: "./artifacts/audit.jsonl"           # change to *_test.jsonl for test runs #
-  per_question_time_cap_sec: 0.0                     # 0 disables; set e.g. 20.0 if you want a guardrail
+  output_csv: "./artifacts/submission.csv"
+  audit_log: "./artifacts/audit.jsonl"
+  per_question_time_cap_sec: 15.0   # guardrail (optional)
