@@ -2,7 +2,7 @@
 from __future__ import annotations
 import argparse, csv, json, time, yaml
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Union
 
 from mas_survey.retrieval import Indices, load_tfidf, retrieve_candidates
 from mas_survey.llm_stance import label_with_llm, together_health_check
@@ -67,7 +67,9 @@ def main() -> None:
 
     # Load indices built by index.build
     tfidf_X, vocab, row_id_map = load_tfidf(Path(cfg["index"]["output_dir"]))
-    whoosh_dir = Path(cfg["whoosh"]["index_dir"]) if cfg["index"].get("build_whoosh", True) else None
+    whoosh_dir = None
+    if cfg.get("whoosh"):
+        whoosh_dir = Path(cfg["whoosh"]["index_dir"])
     idx = Indices(tfidf_X=tfidf_X, vocab=vocab, row_id_map=row_id_map, whoosh_dir=whoosh_dir)
     print(f"[run] tfidf rows={tfidf_X.shape[0]} cols={tfidf_X.shape[1]} | whoosh_dir={whoosh_dir}")
 
@@ -97,11 +99,31 @@ def main() -> None:
             options: List[str] = list(qmeta["distribution"].keys())
             print(f"\n[run] Q{qi}/{len(questions)}: options={len(options)}  '{qtext[:110]}{'...' if len(qtext)>110 else ''}'")
 
-            # 1) retrieve
-            cand_ids: List[str] = retrieve_candidates(qtext, options, cfg, idx)
-            print(f"[run] retrieved candidates={len(cand_ids)} (deduped)")
+            # 1) retrieve (now may return (ids, stats))
+            ret: Union[List[str], Tuple[List[str], dict]] = retrieve_candidates(qtext, options, cfg, idx)
+            if isinstance(ret, tuple):
+                cand_ids, rstats = ret
+            else:
+                cand_ids, rstats = ret, {
+                    "num_queries": None,
+                    "bm25_hits": None,
+                    "tfidf_hits": None,
+                    "fused_size": None,
+                    "uniques_in": None,
+                    "removed_dups": None,
+                    "dup_removed_pct": None,
+                    "final_n": len(ret),
+                    "top_k_sparse": cfg.get("retrieval", {}).get("top_k_sparse"),
+                    "dedup_sim_thresh": cfg.get("filtering", {}).get("dedup_sim_thresh"),
+                }
 
-            # 2) label with LLM (or fallback)
+            dup_pct = rstats.get("dup_removed_pct")
+            if dup_pct is not None:
+                print(f"[run] retrieved candidates={len(cand_ids)}  (dup_removed={dup_pct:.3f})")
+            else:
+                print(f"[run] retrieved candidates={len(cand_ids)}")
+
+            # 2) label with LLM (or baseline)
             topN = int(cfg["labeling"]["top_docs_for_label"])
             label_ids = cand_ids[:topN]
             votes: Dict[str, Tuple[str, float]] = {}
@@ -122,10 +144,9 @@ def main() -> None:
                 parse_success = sum(1 for (opt, _) in votes.values() if opt in options)
                 print(f"[run] LLM parse success: {parse_success}/{len(label_ids)}")
             else:
-                # simple baseline: assign weak decaying weight to first option
                 for i, did in enumerate(label_ids, start=1):
                     votes[did] = (options[0], max(0.05, 1.0 / (i + 10.0)))
-                parse_success = len(label_ids)  # by construction
+                parse_success = len(label_ids)
 
             # 3) aggregate/calibrate
             dist = aggregate_votes(
@@ -135,7 +156,6 @@ def main() -> None:
                 temperature=float(cfg["calibration"]["temperature"]),
                 dirichlet_alpha=float(cfg["calibration"]["dirichlet_alpha"]),
             )
-            # quick sanity: sum to ~1.0
             s = sum(dist.values())
             if not (0.999999 <= s <= 1.000001):
                 print(f"[run][warn] distribution sum={s:.8f} (will still write)")
@@ -144,7 +164,7 @@ def main() -> None:
             supports = select_supports(
                 fused_rank=cand_ids,
                 size=int(cfg["supports"]["size"]),
-                all_candidates_fallback=idx.row_id_map,  # deterministic padding
+                all_candidates_fallback=idx.row_id_map,
             )
 
             # write row + audit
@@ -157,6 +177,7 @@ def main() -> None:
                 "question": qtext,
                 "provider": provider,
                 "model": model if provider == "llm" else None,
+                "retrieval": rstats,                     # <-- intrinsic IR stats for your ablation
                 "n_candidates": len(cand_ids),
                 "labeled": len(label_ids),
                 "llm_parse_success": parse_success if provider == "llm" else None,

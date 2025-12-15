@@ -235,8 +235,6 @@ __pycache__/
 .DS_Store
 
 # allow small evidence snapshots in reports/
-!reports/**/*.csv
-!reports/**/*.jsonl
 
 # data
 data/documents.jsonl
